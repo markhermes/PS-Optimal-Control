@@ -1,0 +1,167 @@
+  
+import numpy as np
+import matplotlib.pyplot as plt
+from PsuedoSpectral import PseudoSpectral
+from scipy.optimize import minimize
+
+class endpoints:
+    def __init__(self,
+                    r_start = 1,
+                    r_end = 4,
+                    vr_start = 0,
+                    vr_end = 0,
+                    vt_start = 1,
+                    vt_end = 0.5):
+        self.r_start = r_start
+        self.r_end = r_end
+        self.vr_start = vr_start
+        self.vr_end = vr_end
+        self.vt_start = vt_start
+        self.vt_end = vt_end
+
+def split_state(x,N):
+
+    #indexing in python is inclusive beginnning exclusive ending. Stupid
+    r = x[0:N]
+    t = x[N:2*N]
+    vr = x[(2*N):3*N]
+    vt = x[(3*N):4*N]
+    ur = x[(4*N):5*N]
+    ut = x[(5*N):(6*N)]
+    return r,t,vr,vt,ur,ut
+
+# Define the objective function
+def objective(x,N,weights):
+    r, t, vr, vt, ur, ut = split_state(x, N)
+    w = weights 
+    objfnc = w@(ur**2) + w@(ut**2)
+    return objfnc
+
+# u constraints - 2N constraints
+def constraint1(x,N):
+    r, t, vr, vt, ur, ut = split_state(x, N)
+    ineq_constraints = ur**2 - 0.25 # abs(vt) <= 0.05
+    return ineq_constraints
+def constraint2(x,N):
+    r, t, vr, vt, ur, ut = split_state(x, N)
+    ineq_constraints = ur**2 - 0.25  # abs(vr) <= 0.05
+    return ineq_constraints
+
+def endpoint_constraints(x,N, num_state_and_ctrl, ps_objs, endpoints):
+
+    # Step1: update the PS function_evals
+    ps_ind = 0;  start_indx = 0; end_indx = N-1
+    
+    # update the ps_objs: might be updated, but do it anyway
+    for ps_obj in ps_objs:
+        ps_obj.func_vals = x[ps_ind*N : (ps_ind+1)*N] 
+    
+    # Initial state constraints at t = t_start
+    time_slide_ind = [start_indx + i * (N-1) for i in range(num_state_and_ctrl)]
+    xstart = x[time_slide_ind]
+    start_constraints = [
+        xstart[0] - endpoints.r_start,     # r at t = t_start
+        xstart[2] - endpoints.vr_start,              # vr at t = t_start (optional)
+        xstart[3] - endpoints.vt_start,              # vt at t = t_start (optional)
+    ]
+    
+    # Final state constraints at t = t_end
+    time_slide_ind = [end_indx + i * (N-1) for i in range(num_state_and_ctrl)]
+    xend = x[time_slide_ind]
+    term_constraints = [
+        xend[0] - endpoints.r_end,
+        xend[2] - endpoints.vr_end,
+        xend[3] - endpoints.vt_end
+    ]
+
+    end_constraints = np.concatenate([start_constraints, term_constraints])
+    
+    return end_constraints
+
+# Dynamics constraint - 4N constraints , where M is the state num = 4
+def dynamics_constraint(x,N,num_states, num_state_and_ctrl,constr_thresh, ps_objs):
+
+    # Step1: update the PS function_evals
+    # Step2: evaluate the polynomial derivates at the points
+    # Step3: evaluate the expected derivatives at the points
+    ps_ind = 0; constraints = []; Dpoly_arr = np.ones((N,num_states))
+    
+    # update the ps_objs: could probably be in the same loop, but logic is hard
+    for ps_obj in ps_objs:
+        ps_obj.func_vals = x[ps_ind*N : (ps_ind+1)*N] 
+        if(ps_ind < num_states): # only add the 4 state dynamics
+            Dpoly_arr[:,ps_ind] = (ps_obj.compute_numerical_derivs())
+        ps_ind += 1
+
+    # grab the states and controls for the time index
+    for time_indx in range(N):
+        time_slide_ind = [time_indx + i * N for i in range(num_state_and_ctrl)]
+        xdot  = evaluate_dynamics(x[time_slide_ind]) #4 dim
+        Dpoly = Dpoly_arr[time_indx,:].transpose()
+        deriv_diff = xdot - Dpoly
+        constraints.append(deriv_diff**2)
+        ineq_constraint = (constraints - constr_thresh*np.ones_like(constraints)).flatten()
+
+    return ineq_constraint
+
+def evaluate_dynamics(x):
+        #x1 is r , x2 is theta, x3 is vr, x4 is vtheta, u0 is ur, u1 is utheta
+        r = x[0]
+        t = x[1]
+        vr = x[2]
+        vt = x[3]
+        ur = x[4]
+        ut = x[5]
+
+        xdot = np.zeros(4)
+        xdot[0] = vr
+        xdot[1] = vt/r
+        xdot[2] = vt**2/r - 1/r**2 + ur
+        xdot[3] = -vr*vt/r + ut 
+
+        return xdot
+
+
+if __name__ == "__main__":
+        
+    # generate the nodes, weights, and differentiation matrix
+    N_order             = 10
+    N_nodes             = N_order + 1
+    t_start             = 0
+    t_end               = 20
+    state_control_dim   = 6
+    state_dim           = 4 # 4 states 2 controls
+    constr_thresh       = 0.01 
+
+    # we have M-ps_objs, where M is the num of states + controls 
+    ps_objs = []
+
+    # Populate the list with instances of PseudoSpectral
+    for i in range(state_control_dim):
+        ps_obj = PseudoSpectral(N_=N_order, time_start_=t_start, time_end_=t_end)
+        ps_objs.append(ps_obj)
+    
+    # get weights
+    weights = ps_obj.cgl_weights
+
+    # Initial guess, r, theta, vr, vt, ur, ut
+    x0 = np.concatenate([np.ones(N_nodes),
+                         np.zeros(N_nodes),
+                         np.zeros(N_nodes),
+                         np.ones(N_nodes),
+                         np.ones(N_nodes),
+                         np.ones(N_nodes)])
+
+    # Constraints 
+    endpts = endpoints()
+    constraints = [
+        {'type': 'ineq', 'fun': lambda x: constraint1(x, N_nodes)},
+        {'type': 'ineq', 'fun': lambda x: constraint2(x, N_nodes)},
+        {'type': 'ineq', 'fun': lambda x: dynamics_constraint(x, N_nodes, state_dim, state_control_dim, constr_thresh, ps_objs)},
+        {'type': 'eq', 'fun': lambda x: endpoint_constraints(x, N_nodes, state_control_dim, ps_objs, endpts)}   
+    ]
+
+    # Call the minimizer
+    result = minimize(objective, x0, args=(N_nodes, weights), constraints=constraints)
+
+    print(result)
